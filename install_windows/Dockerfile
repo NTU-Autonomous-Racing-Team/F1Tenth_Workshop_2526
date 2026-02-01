@@ -54,7 +54,7 @@ RUN git clone https://github.com/f1tenth/f1tenth_lab4_template.git /tmp/lab4_tem
 
 
 # COPY . /sim_ws/src/f1tenth_gym_rosRUN 
-source /opt/ros/foxy/setup.bash && \
+RUN source /opt/ros/foxy/setup.bash && \
     cd sim_ws/ && \
     apt-get update --fix-missing && \
     rosdep install -i --from-path src --rosdistro foxy -y && \
