@@ -50,6 +50,8 @@ RUN git clone https://github.com/f1tenth/f1tenth_lab4_template.git /tmp/lab4_tem
     mkdir -p /sim_ws/src/f1tenth_gym_ros/maps && \
     cp /tmp/lab4_temp/gap_follow/levine_blocked.png /sim_ws/src/f1tenth_gym_ros/maps/ && \
     cp /tmp/lab4_temp/gap_follow/levine_blocked.yaml /sim_ws/src/f1tenth_gym_ros/maps/ && \
+    cp /tmp/lab4_temp/gap_follow/Nuerburgring_map.png /sim_ws/src/f1tenth_gym_ros/maps/ && \
+    cp /tmp/lab4_temp/gap_follow/Nuerburgring_map.yaml /sim_ws/src/f1tenth_gym_ros/maps/ && \
     rm -rf /tmp/lab4_temp
 
 
