@@ -1,429 +1,197 @@
 #!/usr/bin/env python3
-
 import rclpy
 from rclpy.node import Node
 
+import numpy as np
 from sensor_msgs.msg import LaserScan
-from ackermann_msgs.msg import AckermannDriveStamped
-from nav_msgs.msg import Odometry
+from ackermann_msgs.msg import AckermannDriveStamped, AckermannDrive
 from visualization_msgs.msg import Marker, MarkerArray
 
-import numpy as np
-
-# from gap_finder.pid import PID
-from pid import PID
-
-# reference: https://github.com/f1tenth/f1tenth_labs_openrepo/blob/main/f1tenth_lab4/README.md
-# reference: https://www.nathanotterness.com/2019/04/the-disparity-extender-algorithm-and.html 
-
-config = {
-            "disparity_bubble_diameter": 0.4, 
-            "safety_bubble_diameter": 0.4, 
-            "front_bubble_diameter": 0.33, 
-            "minimum_bubble_diameter": 0.33, 
-            "view_angle": 3.142, 
-            "coefficient_of_friction": 0.71, 
-            "disparity_threshold": 0.6, 
-            "lookahead_distance": 10, 
-            "speed_kp": 1.0, 
-            "steering_kp": 1.2, 
-            "wheel_base": 0.324, 
-            "speed_min": 1.0, 
-            "speed_max": 10.0, 
-            "steering_max": 0.5,
-            "speed_low_pass_filter": 0.8, 
-            "steering_low_pass_filter": 0.8, 
-            "bin_number": 7,
-            # Turn ON or OFF features
-            "do_limit_lookahead": True, 
-            "do_prioritise_center": True, 
-            "do_mark_disparity": True, 
-            "do_limit_field_of_view": True, 
-            "do_mark_minimum": True, 
-            "do_mark_sides": False, 
-            "do_min_filter": False, 
-            "do_bin_speed": False, 
-            "do_speed_low_pass_filter": False, 
-            "do_steering_low_pass_filter": False, 
-            "do_visualise": False,
-            # ROS PARAMS
-            "drive_pub_hz": 50, 
-            "scan_topic": "scan", 
-            "drive_topic": "drive"
-        }
-            
-
-class GapFinderAlgorithm:
-    """
-    This class implements the gap finder algorithm. The algorithm takes in a list of ranges from a LiDAR scan and
-    returns a twist dictionary that will move the car to the deepest gap in the scan after drawing safety bubbles.
-    params:
-        - disparity_bubble_diameter: the diameter of the safety bubble
-        - view_angle: the angle of the field of view of the LiDAR as a cone in front of the car
-        - coeffiecient_of_friction: the coeffiecient of friction of the car used for speed calculation
-        - disparity_threshold: the threshold for marking a disparity in the scan i.e. an edge
-        - lookahead_distance : the maximum distance to look ahead in the scan i.e ranges more than this are set to this value
-        - speed_kp: the proportional gain for the speed PID controller
-        - steering_kp: the proportional gain for the steering PID controller
-        - wheel_base: the distance between the front and rear axles of the car
-        - speed_max: the maximum speed of the car
-        - visualise: a boolean to generate visualisation markers
-    """
-    def __init__(self,  disparity_bubble_diameter = 0.4, 
-                        safety_bubble_diameter = 0.4,
-                        front_bubble_diameter = 0.33,
-                        minimum_bubble_diameter = 0.33,
-                        view_angle = 3.142, 
-                        coeffiecient_of_friction = 0.71, 
-                        disparity_threshold = 0.6,
-                        lookahead_distance = None, 
-                        speed_kp = 1.0,
-                        steering_kp = 1.2,
-                        wheel_base = 0.324, 
-                        speed_max = 10.0,
-                        speed_min = 1.0, 
-                        speed_low_pass_filter = 0.8,
-                        steering_low_pass_filter = 0.8,
-                        do_visualise = False, 
-                        bin_number = 7, 
-                        # Turning ON or OFF features
-                        do_limit_lookahead = True, 
-                        do_mark_disparity = True, 
-                        do_mark_minimum = True, 
-                        do_limit_field_of_view = True, 
-                        do_prioritise_center = True, 
-                        do_mark_sides = False, 
-                        do_min_filter = False, 
-                        do_bin_speed = False, 
-                        do_speed_low_pass_filter = False, 
-                        do_steering_low_pass_filter = False):
-        # Tunable Parameters
-        self.disparity_bubble_diameter = disparity_bubble_diameter  # [m]
-        self.safety_bubble_diameter = safety_bubble_diameter  # [m]
-        self.front_bubble_diameter = front_bubble_diameter
-        self.minimum_bubble_diameter = minimum_bubble_diameter
-        self.view_angle = view_angle  # [rad]
-        self.coeffiecient_of_friction = coeffiecient_of_friction
-        self.lookahead_distance = lookahead_distance # [m]
-        self.disparity_threshold = disparity_threshold # [m]
-        self.wheel_base = wheel_base  # [m]
-        self.speed_max = speed_max  # [m/s]
-        self.speed_min = speed_min
-        self.front_bubble_diameter = front_bubble_diameter
-        self.bin_number = bin_number
-        self.speed_low_pass_filter = speed_low_pass_filter
-        self.steering_low_pass_filter = steering_low_pass_filter
-        # Controller Parameters
-        self.speed_pid = PID(Kp=-speed_kp)
-        self.speed_pid.set_point = 0.0
-        self.steering_pid = PID(Kp=-steering_kp)
-        self.steering_pid.set_point = 0.0
-        # Feature Activation
-        self.do_mark_sides = do_mark_sides
-        self.do_min_filter = do_min_filter
-        self.do_limit_lookahead = do_limit_lookahead
-        self.do_mark_disparity = do_mark_disparity
-        self.do_mark_minimum = do_mark_minimum
-        self.do_bin_speed = do_bin_speed
-        self.do_speed_low_pass_filter = do_speed_low_pass_filter
-        self.do_steering_low_pass_filter = do_steering_low_pass_filter
-        self.do_limit_field_of_view = do_limit_field_of_view
-        self.do_prioritise_center = do_prioritise_center
-        # Visualisation
-        self.do_visualise = do_visualise
-        self.safety_markers = {"range":[0.0], "bearing":[0.0]}
-        self.goal_marker = {"range":0.0, "bearing":0.0}
-        # Internal Variables
-        self.initialise = True
-        self.center_priority_mask = None
-        self.fov_bounds = None
-        self.middle_index = None
-        self.last_speed = 0.0
-        self.last_steering = 0.0
-
-    def update(self, scan_msg):
-        ranges = np.array(scan_msg.ranges)
-        angle_increment = scan_msg.angle_increment
-
-        ### INITIALISE ###
-        if self.initialise:
-            if self.lookahead_distance is None:
-                self.lookahead_distance = scan_msg.range_max
-            # middle index for front of car
-            self.middle_index = ranges.shape[0]//2
-            # field of view bounds
-            view_angle_count = self.view_angle//angle_increment
-            lower_bound = int((ranges.shape[0] - view_angle_count)/2)
-            upper_bound = int(lower_bound + view_angle_count)
-            self.fov_bounds = [lower_bound, upper_bound+1]
-            # center priority mask
-            ranges_right = ranges[lower_bound:self.middle_index]
-            ranges_left = ranges[self.middle_index:upper_bound+1]
-            mask_right = np.linspace(0.999, 1.0, ranges_right.shape[0])
-            mask_left = np.linspace(1.0, 0.999, ranges_left.shape[0])
-            self.center_priority_mask = np.concatenate((mask_right, mask_left))
-            self.initialise = False
- 
-        ### LIMIT LOOKAHEAD ##
-        # i.e. scan data in clipped to lookahead distance
-        if (self.do_limit_lookahead):
-            ranges[ranges > self.lookahead_distance] = self.lookahead_distance
-        else :
-            self.lookahead_distance = scan_msg.range_max
-        modified_ranges = ranges.copy()
-
-        ### MIN FILTER ###
-        # each scan datapoint is clipped to the nearest neighbour within a safety bubble
-        if (self.do_min_filter):
-            for i, r in enumerate(ranges):
-                arc = angle_increment * r
-                radius_count = int(self.minimum_bubble_diameter/arc/2)
-                if i < radius_count:
-                    the_min = np.min(ranges[:i+radius_count+1])
-                elif i > ranges.shape[0] - radius_count:
-                    the_min = np.min(ranges[i-radius_count:])
-                else:
-                    the_min = np.min(ranges[i-radius_count:i+radius_count+1])
-                modified_ranges[i] = the_min
-
-        ### LIMIT FIELD OF VIEW ###
-        # i.e. limits the car to a view angle infront of the car.
-        if (self.do_limit_field_of_view):
-            limited_ranges = modified_ranges[self.fov_bounds[0]:self.fov_bounds[1]]
-            limited_modified_ranges = modified_ranges[self.fov_bounds[0]:self.fov_bounds[1]]
-
-        ### MARK LARGE DISPARITY###
-        marked_indexes = []
-        if (self.do_mark_disparity):
-            for i in range(1, limited_ranges.shape[0]):
-                if abs(limited_ranges[i] - limited_ranges[i-1]) > self.disparity_threshold:
-                    if limited_ranges[i] < limited_ranges[i-1]:
-                        r = limited_ranges[i]
-                        arc = angle_increment * r
-                    else:
-                        i -= i
-                        r = limited_ranges[i-1]
-                    arc = angle_increment * r
-                    radius_count = int(self.disparity_bubble_diameter/arc/2)
-                    lower_bound = i-radius_count 
-                    upper_bound = i+radius_count+1
-                    marked_point = [lower_bound, upper_bound, r]
-                    marked_indexes.append(marked_point)
-
-        ### MARK NEAREST SCAN ###
-        if (self.do_mark_minimum):
-            r = np.min(limited_ranges)
-            i = np.argmin(limited_ranges)
-            arc = angle_increment * r
-            radius_count = int(self.safety_bubble_diameter/arc/2)
-            lower_bound = i-radius_count 
-            upper_bound = i+radius_count+1
-            marked_point = [lower_bound, upper_bound, r]
-            marked_indexes.append(marked_point)
-        
-        ### APPLY SAFETY BUBBLE TO MARKED INDEXES ###
-        for mark_point in marked_indexes:
-            limited_modified_ranges[mark_point[0]:mark_point[1]] = mark_point[2]
-
-        ### PRIORITISE CENTER OF SCAN ###
-        if (self.do_prioritise_center):
-            limited_modified_ranges *= self.center_priority_mask
-
-        ### FIND DEEPEST GAP ###
-        max_gap_index = np.argmax(limited_modified_ranges)
-        goal_bearing = angle_increment * (max_gap_index - limited_ranges.shape[0] // 2)
-
-        ### FIND FRONT CLEARANCE ###
-        front_clearance = ranges[self.middle_index] # single laser scan
-        if front_clearance != 0.0: # mean of safety bubble of front scan
-            arc = angle_increment * ranges[self.middle_index]
-            radius_count = int(self.front_bubble_diameter/arc/2)
-            front_clearance = np.mean(ranges[self.middle_index-radius_count:self.middle_index+radius_count])
-
-        ### FIND TWIST ###
-        init_steering = np.arctan(goal_bearing * self.wheel_base) # using ackermann steering model
-        steering = self.steering_pid.update(init_steering)
-
-        # init_speed = np.sqrt(10 * self.coeffiecient_of_friction * self.wheel_base / np.abs(max(np.tan(abs(steering)),1e-16)))
-        # init_speed = front_clearance/self.lookahead_distance * min(init_speed, self.speed_max)
-        init_speed = front_clearance/self.lookahead_distance * self.speed_max
-        speed = self.speed_pid.update(init_speed)
-
-        ### BIN SPEED ###
-        if (self.do_bin_speed):
-            bins = np.linspace(self.speed_min, self.speed_max, self.bin_number)
-            for bin_speed in bins:
-                if (speed < bin_speed):
-                    speed = bin_speed
-                    break
-
-        ### LOW PASS FILTER ###
-        if (self.do_speed_low_pass_filter):
-            speed = self.speed_low_pass_filter * speed + (1-self.speed_low_pass_filter) * self.last_speed
-        if (self.do_steering_low_pass_filter):
-            speed = self.steering_low_pass_filter * steering + (1-self.steering_low_pass_filter) * self.last_steering
-
-        self.last_speed = speed
-        self.last_steering = steering
-
-        ackermann = {"speed": speed, "steering": steering}
-
-        ### VISUALISATION ###
-        if self.do_visualise:
-            # Visualise Modified Ranges
-            self.safety_scan_msg = scan_msg
-            scan_msg.ranges = modified_ranges.tolist()
-            # Visualise Marked Ranges
-            self.safety_markers["range"].clear()
-            self.safety_markers["bearing"].clear()
-            for i_range in marked_indexes:
-                bearing = angle_increment * (i_range[0] - ranges.shape[0]//2)
-                self.safety_markers["range"].append(i_range[1])
-                self.safety_markers["bearing"].append(bearing)
-            # Visualise Goal
-            self.goal_marker["range"] = modified_ranges[max_gap_index]
-            self.goal_marker["bearing"] = goal_bearing
-
-        return ackermann
-    
-    def get_bubble_coord(self):
-        m = []
-        for i, r in enumerate(self.safety_markers["range"]):
-            x = r * np.cos(self.safety_markers["bearing"][i])
-            y = r * np.sin(self.safety_markers["bearing"][i])
-            m.append([x, y])
-        return m
-
-    def get_goal_coord(self):
-        x = self.goal_marker["range"] * np.cos(self.goal_marker["bearing"])
-        y = self.goal_marker["range"] * np.sin(self.goal_marker["bearing"])
-        return [x, y]
-
-    def get_safety_scan(self):
-        return self.safety_scan_msg
-
-
-class GapFinderNode(Node):
-    """
-    ROS2 Node Class that handles all the subscibers and publishers for the gap finder algorithm. 
-    It abstracts the gap finder algorithm from the ROS2 interface.
-    The only things to tune or change are in the sections:
-    - ROS2 PARAMETERS
-    - SPEED AND STEERING LIMITS
-    - GAP FINDER ALGORITHM
-    """
+class GapFollower(Node):
     def __init__(self):
-        ### ROS2 PARAMETERS ###
-        self.hz = config["drive_pub_hz"] # [Hz]
-        self.timeout = 1.0 # [s]
-        self.visualise = config["do_visualise"]
-        scan_topic = config["scan_topic"]
-        # drive_topic = "/nav/drive"
-        drive_topic = config["drive_topic"]
+        super().__init__('gap_follower')
+ 
+        self.declare_parameter('lookahead_distance', 5.0) 
+        self.declare_parameter('robot_width', 0.2032)
+        self.declare_parameter('obstacle_bubble_radius', 0.15) 
+        self.declare_parameter('disparity_threshold', 0.5) 
+        self.declare_parameter('max_speed', 5.0) #10.0 
+        self.declare_parameter('min_speed', 1.0)
+        self.declare_parameter('max_steering', 0.34) 
+        self.declare_parameter('disparity_bubble_radius', 0.15)
+        self.declare_parameter('consecutive_valid_gap', 5)
+        self.declare_parameter('steering_gain', 0.4) 
+        self.declare_parameter('speed_gain', 1.0) 
+        self.declare_parameter('field_of_vision', np.pi/2)
+        self.declare_parameter('lidarscan_topic', '/scan')
+        self.declare_parameter('drive_topic', '/drive')
+            
+        self.lookahead_distance     = self.get_parameter('lookahead_distance').value
+        self.robot_width            = self.get_parameter('robot_width').value
+        self.obstacle_bubble_radius = self.get_parameter('obstacle_bubble_radius').value
+        self.disparity_threshold    = self.get_parameter('disparity_threshold').value
+        self.max_speed              = self.get_parameter('max_speed').value
+        self.min_speed              = self.get_parameter('min_speed').value
+        self.max_steering           = self.get_parameter('max_steering').value
+        self.disparity_bubble_radius= self.get_parameter('disparity_bubble_radius').value
+        self.consecutive_valid_gap  = self.get_parameter('consecutive_valid_gap').value
+        self.steering_gain          = self.get_parameter('steering_gain').value
+        self.speed_gain             = self.get_parameter('speed_gain').value
+        self.field_of_vision        = self.get_parameter('field_of_vision').value
+        self.lidar_scan_topic       = self.get_parameter('lidarscan_topic').value
+        self.drive_topic            = self.get_parameter('drive_topic').value
+            
+        self.subscriber = self.create_subscription(LaserScan, 
+                                                   self.lidar_scan_topic,
+                                                   self.lidar_callback,
+                                                   10)
+        
+        self.publisher = self.create_publisher(AckermannDriveStamped,
+                                                self.drive_topic,
+                                                10)
 
-        ### SPEED AND STEERING LIMITS ###
-        # Speed limits
-        self.max_speed = config["speed_max"] # [m/s]
-        self.min_speed = config["speed_min"] # [m/s]        
-        # Acceleration limits
-        self.max_acceleration = None # [m/s^2]
-        # Steering limits
-        self.max_steering = config["steering_max"] # [rad]
+        self.bubble_viz_publisher = self.create_publisher(MarkerArray, "/safety_bubble", 10)
+        self.scan_viz_publisher = self.create_publisher(MarkerArray, "/scan_msg", 10)
+        self.gap_viz_publisher = self.create_publisher(Marker, "/goal_point", 10)
+        self.dispa_viz_publisher = self.create_publisher(MarkerArray, "/disparity_points", 10)
 
-        ### GAP FINDER ALGORITHM ###
-        self.gapFinderAlgorithm = GapFinderAlgorithm(   disparity_bubble_diameter = config["disparity_bubble_diameter"], 
-                                                        safety_bubble_diameter = config["safety_bubble_diameter"],
-                                                        front_bubble_diameter = config["front_bubble_diameter"],
-                                                        minimum_bubble_diameter = config["minimum_bubble_diameter"],
-                                                        view_angle = config["view_angle"], 
-                                                        coeffiecient_of_friction = config["view_angle"], 
-                                                        disparity_threshold = config["disparity_threshold"],
-                                                        lookahead_distance = config["lookahead_distance"], 
-                                                        speed_kp = config["speed_kp"],
-                                                        steering_kp = config["steering_kp"],
-                                                        wheel_base = config["wheel_base"], 
-                                                        speed_max = config["speed_max"],
-                                                        speed_min = config["speed_min"], 
-                                                        do_visualise = config["do_visualise"], #only works in sim 
-                                                    )
+    def preprocess_lidar(self,data):
+        """ Preprocess the LiDAR scan array. Expert implementation includes:
+            1.Setting each value to the mean over some window
+            2.Rejecting high values (eg. > 3m)
+        """
+        # convert the FOV into indices
+        ranges = np.array(data.ranges)
+        fov_indices = int(self.field_of_vision / data.angle_increment)
+        center_index = int(abs(data.angle_min) / data.angle_increment)  # // will return float, e.g. 540.0 if input is float value
+        fov_start_i = center_index - fov_indices
+        fov_end_i = center_index + fov_indices
 
-        ### ROS2 NODE ###
-        super().__init__("gap_finder")
-        # Scan Subscriber
-        self.scan_subscriber = self.create_subscription(LaserScan, scan_topic, self.scan_callback, 1)
-        self.scan_subscriber  # prevent unused variable warning
-        self.scan_ready = False
-        self.last_scan_time = self.get_time()
-        # Drive Publisher
-        self.drive_msg = AckermannDriveStamped()
-        self.last_drive_msg = AckermannDriveStamped()
-        self.drive_publisher = self.create_publisher(AckermannDriveStamped, drive_topic, 1)
-        self.last_drive_time = self.get_time()
-       # Viz Publishers
-        if self.visualise:
-            self.init_visualisation()
-        # Timer
-        self.timer = self.create_timer(1/self.hz , self.timer_callback)
+        # handle edge cases
+        fov_start_i = max(0, fov_start_i)
+        fov_end_i = min(len(ranges)-1, fov_end_i)
+
+        limited_ranges = np.copy(ranges)  # Alt: Truncate the ranges array
+        limited_ranges[:fov_start_i] = 0
+        limited_ranges[fov_end_i+1:] = 0
+
+        # find nearest obstacle distance & index
+        nearest_obstacle_distance = np.min(limited_ranges[limited_ranges > 0])
+        nearest_obstacle_distance_indices = np.where(limited_ranges == nearest_obstacle_distance)
+
+        # find the angle and indices span of the obstacle bubble 
+        obs_bubble_half_angle = np.arctan(self.obstacle_bubble_radius / nearest_obstacle_distance)
+        obs_bubble_index_extension = int(np.ceil(obs_bubble_half_angle / data.angle_increment))
+
+        obs_bubble_start_i = np.maximum(0, nearest_obstacle_distance_indices[0] - obs_bubble_index_extension)
+        obs_bubble_end_i = np.minimum(len(limited_ranges)-1, nearest_obstacle_distance_indices[0] + obs_bubble_index_extension)
+        valid_limited_ranges = np.copy(limited_ranges)
+
+        # draw safety bubble
+        for start, end in zip(obs_bubble_start_i, obs_bubble_end_i):
+            valid_limited_ranges[start:end] = 0
+
+        proc_ranges = np.copy(valid_limited_ranges)
+
+        # find bubble_coord
+        nearest_obstacle_angle = data.angle_min + nearest_obstacle_distance_indices[0] * data.angle_increment
+        obs_x = nearest_obstacle_distance * np.cos(nearest_obstacle_angle)
+        obs_y = nearest_obstacle_distance * np.sin(nearest_obstacle_angle)
+
+        # Turns [[x1, x2], [y1, y2]] into [[x1, y1], [x2, y2]]
+        obs_bubble_coord = np.array([obs_x,obs_y]).T
+
+        return proc_ranges, obs_bubble_coord, fov_start_i, fov_end_i
+
+    def find_max_gap(self, data, proc_ranges):
+        """ Return the start index & end index of the max gap in proc_ranges
+        """
+        # find the furthest point in the processed ranges array
+        max_dist = np.max(proc_ranges)
+        max_dist_indices = np.where(proc_ranges == max_dist)[0]
+
+        if len(max_dist_indices) > 1:
+            max_dist_index = max_dist_indices[len(max_dist_indices)//2]
+        else:
+            max_dist_index = max_dist_indices[0]
+        
+        # find goal coord
+        goal_distance = proc_ranges[max_dist_index]
+        goal_angle = data.angle_min + max_dist_index * data.angle_increment
+        goal_x = goal_distance * np.cos(goal_angle)
+        goal_y = goal_distance * np.sin(goal_angle)
+        goal_coord = np.array([goal_x, goal_y])
     
-    def init_visualisation(self):
-        # Safety Viz Publisher
-        self.bubble_viz_publisher = self.create_publisher(MarkerArray, "/safety_bubble", 1)
-        self.bubble_viz_msg = Marker()
-        self.bubble_viz_msg.header.frame_id = "/base_link"
-        self.bubble_viz_msg.color.a = 1.0
-        self.bubble_viz_msg.color.r = 1.0
-        self.bubble_viz_msg.scale.x = self.gapFinderAlgorithm.disparity_bubble_diameter
-        self.bubble_viz_msg.scale.y = self.gapFinderAlgorithm.disparity_bubble_diameter
-        self.bubble_viz_msg.scale.z = self.gapFinderAlgorithm.disparity_bubble_diameter
-        self.bubble_viz_msg.type = Marker.SPHERE
-        self.bubble_viz_msg.action = Marker.ADD
-        # Goal Viz Publisher
-        self.gap_viz_publisher = self.create_publisher(Marker, "/goal_point", 1)
-        self.goal_viz_msg = Marker()
-        self.goal_viz_msg.header.frame_id = "/base_link"
-        self.goal_viz_msg.color.a = 1.0
-        self.goal_viz_msg.color.g = 1.0
-        self.goal_viz_msg.scale.x = 0.3
-        self.goal_viz_msg.scale.y = 0.3
-        self.goal_viz_msg.scale.z = 0.3
-        self.goal_viz_msg.type = Marker.SPHERE
-        self.goal_viz_msg.action = Marker.ADD
-        # Laser Viz Publisher
-        self.laser_publisher = self.create_publisher(LaserScan, "/safety_scan", 1)
+        return max_dist_index, goal_coord
 
-    def get_time(self):
-        """
-        Returns the current time in seconds
-        """
-        return self.get_clock().now().to_msg().sec + self.get_clock().now().to_msg().nanosec * 1e-9
+    def disparity_extender(self, data):
+        proc_ranges, obs_bubble_coord, fov_start_i, fov_end_i = self.preprocess_lidar(data)
 
-    def scan_callback(self, scan_msg):
-        self.scan_ready = True
-        self.scan_msg = scan_msg
-        self.last_scan_time = self.get_time()
+        # find the difference between elements n+1 and n
+        range_diffs = np.abs(np.diff(proc_ranges))
+        disparity_indices = np.where(range_diffs > self.disparity_threshold)[0]
 
-    def publish_drive_msg(self, drive={"speed": 0.0, "steering": 0.0}):
-        self.drive_msg.drive.speed = float(drive["speed"])
-        self.drive_msg.drive.steering_angle = float(drive["steering"])
-        self.drive_publisher.publish(self.drive_msg)
-        self.last_drive_msg = self.drive_msg
-        self.last_drive_time = self.get_time()
+        if len(disparity_indices) == 0:
+            proc_ranges = np.where(proc_ranges > self.lookahead_distance, self.lookahead_distance, proc_ranges)
+            return proc_ranges, obs_bubble_coord, fov_start_i, fov_end_i, []
+        
+        # '>0.01': avoid mistreat the index next to the 'zero' we created ourselves as a disparity
+        valid_indices_mask = (proc_ranges[disparity_indices] > 0.01) & (proc_ranges[disparity_indices + 1] > 0.01)
+        # e.g., VALID INDICES MASK: [False  True  True  True  True  True  True  True  True  True  True  True]
+        disparity_indices = disparity_indices[valid_indices_mask] 
 
-    def publish_viz_msgs(self):
-        safety_scan = self.gapFinderAlgorithm.get_safety_scan()
-        bubble_coord = self.gapFinderAlgorithm.get_bubble_coord()
-        goal_coord = self.gapFinderAlgorithm.get_goal_coord()
-        laser_viz_msg = safety_scan
+        if len(disparity_indices) == 0:
+            proc_ranges = np.where(proc_ranges > self.lookahead_distance, self.lookahead_distance, proc_ranges)
+            return proc_ranges, obs_bubble_coord, fov_start_i, fov_end_i, []
+
+        
+        # find disparity coord
+        disparity_angles = data.angle_min + disparity_indices * data.angle_increment
+        disparity_x = proc_ranges[disparity_indices] * np.cos(disparity_angles) 
+        disparity_y = proc_ranges[disparity_indices] * np.sin(disparity_angles) 
+        disparity_coord = np.column_stack((disparity_x, disparity_y))
+        
+        # draw disparity bubble
+        # Ensure the bubble drawn is always based on the closer distance
+        p1 = proc_ranges[disparity_indices]
+        p2 = proc_ranges[disparity_indices + 1] # confirm not out of bounds as index from |135deg| to |90deg| has alr been set to 0
+        dist_for_calculation = np.minimum(p1, p2)
+
+        dispa_bubble_half_angle = np.arctan(self.disparity_bubble_radius / dist_for_calculation)
+        dispa_bubble_index_extension = (dispa_bubble_half_angle / data.angle_increment).astype(int)
+        dispa_bubble_start_i = np.maximum(0, disparity_indices - dispa_bubble_index_extension)
+        dispa_bubble_end_i = np.minimum(len(proc_ranges)-1,disparity_indices + dispa_bubble_index_extension)
+
+        for start, end in zip(dispa_bubble_start_i, dispa_bubble_end_i):
+            proc_ranges[start:end] = 0.0
+
+        # cap vehicle vision
+        proc_ranges = np.where(proc_ranges > self.lookahead_distance, self.lookahead_distance, proc_ranges)
+
+        return proc_ranges, obs_bubble_coord, fov_start_i, fov_end_i, disparity_coord
+
+    def get_ranges_coord(self, data, proc_ranges, fov_start_i ,fov_end_i):
+        indices = np.arange(len(proc_ranges[fov_start_i:fov_end_i+1]))
+        angles = -np.pi/2 + (indices * data.angle_increment)
+
+        x_coords = proc_ranges[fov_start_i:fov_end_i+1] * np.cos(angles)
+        y_coords = proc_ranges[fov_start_i:fov_end_i+1] * np.sin(angles)
+
+        ranges_coord = np.column_stack((x_coords, y_coords))
+        # both .T and .column_stack work        
+        return ranges_coord
+
+    
+    def visualisation_marker(self, bubble_coord, goal_coord, scan_msg_coord, dispa_coord):
         bubble_array_viz_msg = MarkerArray()
-
         for i, coord in enumerate(bubble_coord):
             self.bubble_viz_msg = Marker()
             self.bubble_viz_msg.header.frame_id = "ego_racecar/base_link"
             self.bubble_viz_msg.color.a = 1.0
             self.bubble_viz_msg.color.r = 1.0
-            self.bubble_viz_msg.scale.x = self.gapFinderAlgorithm.disparity_bubble_diameter
-            self.bubble_viz_msg.scale.y = self.gapFinderAlgorithm.disparity_bubble_diameter
-            self.bubble_viz_msg.scale.z = self.gapFinderAlgorithm.disparity_bubble_diameter
+            self.bubble_viz_msg.scale.x = self.obstacle_bubble_radius
+            self.bubble_viz_msg.scale.y = self.obstacle_bubble_radius
+            self.bubble_viz_msg.scale.z = self.obstacle_bubble_radius
             self.bubble_viz_msg.type = Marker.SPHERE
             self.bubble_viz_msg.action = Marker.ADD
             self.bubble_viz_msg.id = i
@@ -431,64 +199,92 @@ class GapFinderNode(Node):
             self.bubble_viz_msg.pose.position.y = coord[1]
             bubble_array_viz_msg.markers.append(self.bubble_viz_msg)
 
-        self.goal_viz_msg.pose.position.x = goal_coord[0]
-        self.goal_viz_msg.pose.position.y = goal_coord[1]
+        scan_array_viz_msg = MarkerArray()
+        for i, coord in enumerate(scan_msg_coord):
+            self.scan_viz_msg = Marker()
+            self.scan_viz_msg.header.frame_id = "ego_racecar/base_link"
+            self.scan_viz_msg.color.b = 0.95
+            self.scan_viz_msg.color.a = 0.5
+            self.scan_viz_msg.scale.x = 0.2
+            self.scan_viz_msg.scale.y = 0.2
+            self.scan_viz_msg.scale.z = 0.2
+            self.scan_viz_msg.type = Marker.CYLINDER
+            self.scan_viz_msg.action = Marker.ADD
+            self.scan_viz_msg.id = i
+            self.scan_viz_msg.pose.position.x = coord[0]
+            self.scan_viz_msg.pose.position.y = coord[1]
+            scan_array_viz_msg.markers.append(self.scan_viz_msg)
 
+        dispa_array_viz_msg = MarkerArray()
+        for i, coord in enumerate(dispa_coord):
+            self.dispa_viz_msg = Marker()
+            self.dispa_viz_msg.header.frame_id = "ego_racecar/base_link"
+            self.dispa_viz_msg.color.r = 0.95
+            self.dispa_viz_msg.color.g = 0.7
+            self.dispa_viz_msg.color.b = 0.83
+            self.dispa_viz_msg.color.a = 0.8
+            self.dispa_viz_msg.scale.x = self.disparity_bubble_radius
+            self.dispa_viz_msg.scale.y = self.disparity_bubble_radius
+            self.dispa_viz_msg.scale.z = self.disparity_bubble_radius
+            self.dispa_viz_msg.type = Marker.SPHERE
+            self.dispa_viz_msg.action = Marker.ADD
+            self.dispa_viz_msg.id = i
+            self.dispa_viz_msg.pose.position.x = coord[0]
+            self.dispa_viz_msg.pose.position.y = coord[1]
+            dispa_array_viz_msg.markers.append(self.dispa_viz_msg)
+
+        self.goal_viz_msg = Marker()
+        self.goal_viz_msg.header.frame_id = "ego_racecar/base_link"
+        self.goal_viz_msg.color.r = 0.3
+        self.goal_viz_msg.color.g = 0.7
+        self.goal_viz_msg.color.b = 0.0
+        self.goal_viz_msg.color.a = 0.8
+        self.goal_viz_msg.scale.x = 0.3
+        self.goal_viz_msg.scale.y = 0.3
+        self.goal_viz_msg.scale.z = 0.3
+        self.goal_viz_msg.type = Marker.CYLINDER
+        self.goal_viz_msg.action = Marker.ADD
+        self.goal_viz_msg.pose.position.x = float(goal_coord[0])
+        self.goal_viz_msg.pose.position.y = float(goal_coord[1])
+        
         self.bubble_viz_publisher.publish(bubble_array_viz_msg)
         self.gap_viz_publisher.publish(self.goal_viz_msg)
-        self.laser_publisher.publish(laser_viz_msg)
-
-
-    def timer_callback(self):
-        if self.scan_ready:
-            ### UPDATE GAP FINDER ALGORITHM ###
-            drive = self.gapFinderAlgorithm.update(self.scan_msg)
-
-            ### APPLY SPEED AND STEERING LIMITS ###
-            # steering limits
-            drive["steering"] = np.sign(drive["steering"]) * min(np.abs(drive["steering"]), self.max_steering)
-            # speed limits
-            drive["speed"] = max(drive["speed"], self.min_speed)
-            drive["speed"] = min(drive["speed"], self.max_speed)
-            # acceleration limits
-            if self.max_acceleration is not None:
-                dt = self.get_time() - self.last_drive_time
-                d_speed = drive["speed"] - self.last_drive_msg.drive.speed
-                if abs(d_speed) > self.max_acceleration * dt:
-                    # accelerate
-                    if drive["speed"] > self.last_drive_msg.drive.speed:
-                        drive["speed"] = self.last_drive_msg.drive.speed + self.max_acceleration
-                    # decelerate
-                    else:
-                        drive["speed"] = self.last_drive_msg.drive.speed - self.max_acceleration
-            # drive["speed"] = 0.0
-
-            ### PUBLISH DRIVE MESSAGE ###
-            self.publish_drive_msg(drive)
-            self.last_time = self.get_time()
+        self.scan_viz_publisher.publish(scan_array_viz_msg)
+        self.dispa_viz_publisher.publish(dispa_array_viz_msg)
+ 
+    def lidar_callback(self, data):
+        """ Process each LiDAR scan as per the Follow Gap algorithm & publish an AckermannDriveStamped Message
+        """
+        proc_ranges, obs_bubble_coord, fov_start_i, fov_end_i, dispa_coord = self.disparity_extender(data)
+        max_dist_index, goal_coord = self.find_max_gap(data, proc_ranges)
+        ranges_coord = self.get_ranges_coord(data, proc_ranges, fov_start_i, fov_end_i)
         
-            #### PUBLISH VISUALISATION MESSAGES ###
-            if self.visualise:
-                self.publish_viz_msgs()
+        msg = AckermannDriveStamped()
+        steering_angle = 0.0
+        if max_dist_index is not None:
+            steering_angle = data.angle_min + max_dist_index * data.angle_increment
+            steering_angle = np.clip(steering_angle * self.steering_gain, -self.max_steering, self.max_steering)
+            msg.drive.steering_angle = steering_angle
+        
+        raw_speed = self.max_speed - abs(steering_angle) * self.speed_gain
+        msg.drive.speed = max(self.min_speed, raw_speed)
 
-        ### TIMEOUT ###
-        if ((self.get_time() - self.last_scan_time) > self.timeout):
-            # self.scan_ready = False
-            pass
+        self.visualisation_marker(obs_bubble_coord, goal_coord, ranges_coord, dispa_coord)
+
+        self.get_logger().info(f'steering_angle: {msg.drive.steering_angle}, speed: {msg.drive.speed}') 
+
+        self.publisher.publish(msg)
+        print("Published Drive Message")
 
 def main(args=None):
     rclpy.init(args=args)
+    reactive_node = GapFollower()
+    print("I am blind, I can't find the gap :(")
+    rclpy.spin(reactive_node)
 
-    gapFinder = GapFinderNode()
-
-    rclpy.spin(gapFinder)
-
-    # Destroy the node explicitly
-    # (optional - otherwise it will be done automatically
-    # when the garbage collector destroys the node object)
-    gapFinder.destroy_node()
+    reactive_node.destroy_node()
     rclpy.shutdown()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
