@@ -50,9 +50,15 @@ RUN git clone https://github.com/f1tenth/f1tenth_lab4_template.git /tmp/lab4_tem
     mkdir -p /sim_ws/src/f1tenth_gym_ros/maps && \
     cp /tmp/lab4_temp/gap_follow/levine_blocked.png /sim_ws/src/f1tenth_gym_ros/maps/ && \
     cp /tmp/lab4_temp/gap_follow/levine_blocked.yaml /sim_ws/src/f1tenth_gym_ros/maps/ && \
-    cp /tmp/lab4_temp/gap_follow/Nuerburgring_map.png /sim_ws/src/f1tenth_gym_ros/maps/ && \
-    cp /tmp/lab4_temp/gap_follow/Nuerburgring_map.yaml /sim_ws/src/f1tenth_gym_ros/maps/ && \
     rm -rf /tmp/lab4_temp
+
+# add Nuerburgring map into f1tenth simulator
+RUN git clone https://github.com/f1tenth/f1tenth_racetracks.git /tmp/racetracks && \
+    mkdir -p /sim_ws/src/f1tenth_gym_ros/maps && \
+    cp /tmp/racetracks/Nuerburgring/Nuerburgring_map.png /sim_ws/src/f1tenth_gym_ros/maps/ && \
+    cp /tmp/racetracks/Nuerburgring/Nuerburgring_map.yaml /sim_ws/src/f1tenth_gym_ros/maps/ && \
+    rm -rf /tmp/racetracks
+
 
 
 # COPY . /sim_ws/src/f1tenth_gym_ros
